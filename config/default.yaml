@@ -1,0 +1,4 @@
+default_region: California Current
+default_start: 2023-01-01
+default_end: 2023-03-31
+default_stride: 10

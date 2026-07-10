@@ -1,0 +1,3 @@
+# Isolated HDF4 reader environment
+numpy==2.2.3
+pyhdf==0.11.6
