@@ -13,13 +13,18 @@ from trident.utils.dates import month_starts, month_code
 from trident.data.osu.archive import load_inventory
 from trident.data.esa.occi import ESA_PRODUCTS, esa_status, inspect_copernicus_dataset
 from trident.workflows.osu_replay import run_range
-from trident.workflows.series import validation_series, standard_series
+from trident.workflows.series import (
+    discover_validation_runs,
+    validation_series,
+    standard_series,
+)
 from trident.workflows.standard import production_status, standard_cache_status, DEFAULT_NASA_COLLECTIONS, DEFAULT_CMEMS_DATASET, DEFAULT_CMEMS_VARIABLES
 from trident.workflows.native import NativeWorkflowRequest, run_native_download
 from trident.workflows.native_prepare import prepare_native_inputs, run_native_cafe
 from trident.workflows.catalog import FAMILIES, group_by_family
 from trident.workflows.merge import build_source_manifest
 from trident.grids.align import mask_feasible
+from trident.viz.maps import make_geo_heatmap as make_geo_heatmap_v2
 
 PRESETS = {
     "California Current": (-132, 28, -116, 45),
@@ -229,7 +234,7 @@ def _explore(root):
     variables = list(ds.data_vars)
     preferred = next((v for v in ("difference", "cafe_npp", "trident_replay_npp", "osu_archived_npp", "chl") if v in variables), variables[0])
     var = st.selectbox("Variable", variables, index=variables.index(preferred))
-    st.plotly_chart(make_geo_heatmap(ds, var, f"{entry.label} — {tag}"), use_container_width=True)
+    st.plotly_chart(make_geo_heatmap_v2(ds, var, f"{entry.label} — {tag}"), use_container_width=True)
     with st.expander("Dataset details"):
         st.write(entry.path)
         st.write(ds)
@@ -281,18 +286,159 @@ def app():
     with validation:
         st.subheader("OSU replay / validation")
         st.dataframe(cache_status(root, start, end), use_container_width=True)
-        if st.button("Run OSU replay and compare with archived OSU NPP", type="primary"):
-            with st.status("Running OSU replay/validation...", expanded=True) as status:
-                result = run_range(root, start, end, bbox, stride=int(stride))
+
+        if st.button(
+            "Run OSU replay and compare with archived OSU NPP",
+            type="primary",
+        ):
+            with st.status(
+                "Running OSU replay/validation...",
+                expanded=True,
+            ) as status:
+                result = run_range(
+                    root,
+                    start,
+                    end,
+                    bbox,
+                    stride=int(stride),
+                )
                 st.json(result)
-                status.update(label="OSU validation complete", state="complete")
-        vdf = validation_series(root, bbox, stride=int(stride))
-        sdf = standard_series(root, bbox)
-        if len(vdf):
-            st.plotly_chart(_plot_validation(vdf, sdf), use_container_width=True)
-            st.dataframe(vdf, use_container_width=True)
+                status.update(
+                    label="OSU validation complete",
+                    state="complete",
+                )
+
+            # Ensure the next render discovers only files that now exist.
+            st.cache_data.clear()
+            st.session_state["validation_plot_scope"] = (
+                "Selected date range"
+            )
+            st.rerun()
+
+        st.markdown("### Regional NPP comparison")
+        st.caption(
+            "The plot reads only completed comparison NetCDF files. "
+            "It never combines unrelated replay outputs or old report tables."
+        )
+
+        completed = discover_validation_runs(
+            root,
+            stride=int(stride),
+        )
+
+        scope_options = [
+            "Selected date range",
+            "Choose specific completed runs",
+            "All completed runs at this stride",
+        ]
+        current_scope = st.session_state.get(
+            "validation_plot_scope",
+            "Selected date range",
+        )
+        if current_scope not in scope_options:
+            current_scope = "Selected date range"
+
+        plot_scope = st.radio(
+            "Data shown in the plot",
+            scope_options,
+            index=scope_options.index(current_scope),
+            horizontal=True,
+            key="validation_plot_scope",
+        )
+
+        selected_paths = None
+        plot_start = None
+        plot_end = None
+
+        if plot_scope == "Selected date range":
+            plot_start = start
+            plot_end = end
+            filtered = completed[
+                (completed["date"] >= pd.Timestamp(start))
+                & (
+                    completed["date"]
+                    <= pd.Timestamp(end) + pd.offsets.MonthEnd(0)
+                )
+            ]
+            st.caption(
+                f"Showing completed stride-{int(stride)} runs from "
+                f"{start} through {end}: {len(filtered)} dataset(s)."
+            )
+
+        elif plot_scope == "Choose specific completed runs":
+            labels = {
+                (
+                    f"{row.date:%Y-%m} | stride {row.stride} | "
+                    f"{row.file}"
+                ): row.path
+                for row in completed.itertuples(index=False)
+            }
+            default_labels = list(labels)[-1:] if labels else []
+            chosen_labels = st.multiselect(
+                "Completed validation datasets",
+                options=list(labels),
+                default=default_labels,
+            )
+            selected_paths = [
+                labels[label] for label in chosen_labels
+            ]
+
         else:
-            st.info("Run at least one month to create the direct two-line OSU vs TRIDENT comparison.")
+            st.caption(
+                f"Showing all {len(completed)} completed "
+                f"stride-{int(stride)} comparison dataset(s)."
+            )
+
+        if st.button("Refresh completed-run list"):
+            st.cache_data.clear()
+            st.rerun()
+
+        vdf = validation_series(
+            root,
+            bbox,
+            stride=int(stride),
+            selected_files=selected_paths,
+            start=plot_start,
+            end=plot_end,
+        )
+        sdf = standard_series(
+            root,
+            bbox,
+            start=plot_start,
+            end=plot_end,
+        )
+
+        if len(vdf):
+            st.plotly_chart(
+                _plot_validation(vdf, sdf),
+                use_container_width=True,
+            )
+
+            display_columns = [
+                "tag",
+                "stride",
+                "trident_replay_mean",
+                "osu_archived_mean",
+                "bias",
+                "percent_bias",
+                "rmse",
+                "valid_pixels",
+                "file",
+            ]
+            st.dataframe(
+                vdf[display_columns],
+                use_container_width=True,
+            )
+
+            with st.expander("Exact datasets used for this plot"):
+                for path in vdf["path"]:
+                    st.code(path)
+        else:
+            st.info(
+                "No completed validation comparison file matches the "
+                "selected plot scope. Run the requested month(s), or choose "
+                "another completed dataset."
+            )
 
     with native:
         _native_download_controls(root, start, end, bbox, temporal)
