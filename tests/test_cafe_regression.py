@@ -76,3 +76,37 @@ def test_wrapper_matches_diagnostic_engine(case_name: str) -> None:
     assert compact.npp == diagnostic.npp
     assert compact.zeu == diagnostic.zeu
     assert compact.kdpar == diagnostic.kdpar
+
+from trident.models.cafe import CafeProfileResult, cafe_profile, integrate_npp_profile
+
+
+@pytest.mark.parametrize("case_name", CASES)
+def test_profile_preserves_integrated_npp(case_name: str) -> None:
+    args = CASES[case_name]["inputs"]
+    legacy = cafe_pixel(*args)
+    profile = cafe_profile(*args)
+
+    assert isinstance(profile, CafeProfileResult)
+    assert profile.npp == legacy.npp
+    assert integrate_npp_profile(
+        profile.depth_m, profile.npp_z, delz_m=profile.delz_m
+    ) == profile.npp
+
+
+@pytest.mark.parametrize("case_name", CASES)
+def test_profile_dimensions_and_coordinates(case_name: str) -> None:
+    profile = cafe_profile(*CASES[case_name]["inputs"])
+
+    assert profile.depth_m.shape == (101,)
+    assert profile.time_fraction.shape == (51,)
+    assert profile.wavelength_nm.shape == (31,)
+    assert profile.npp_z.shape == (101,)
+    assert profile.npp_tz.shape == (51, 101)
+    assert profile.irradiance_tz.shape == (51, 101)
+    assert profile.irradiance_tzw.shape == (51, 101, 31)
+    assert profile.ek_z.shape == (101,)
+    assert profile.kpur_z.shape == (101,)
+    assert profile.phimax_z.shape == (101,)
+    assert profile.par_z_noon.shape == (101,)
+    assert profile.depth_m[0] == 0.0
+    assert np.all(np.diff(profile.depth_m) > 0)

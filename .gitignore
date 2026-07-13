@@ -23,6 +23,13 @@ logs/
 trident_env_report.json
 .DS_Store
 
+# Local development backups and one-off patch snapshots
+.trident_backups/
+.trident_native_ui_v2_backup
+development_baselines/
+*.before_*
+*.pre_scientist_interface
+
 # Local Python environments
 .venv/
 .venv-hdf/

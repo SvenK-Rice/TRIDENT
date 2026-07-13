@@ -282,6 +282,17 @@ def run_month(
             "cafe_npp": (("lat", "lon"), npp),
             "zeu": (("lat", "lon"), zeu),
             "kdpar": (("lat", "lon"), kdpar),
+            # Preserve the normalized CAFE inputs so any map pixel can be
+            # reconstructed later with cafe_profile() without reopening or
+            # redownloading the original source products.
+            "par": dataset["par"].astype("float32"),
+            "chl": dataset["chl"].astype("float32"),
+            "mld": dataset["mld"].astype("float32"),
+            "aph443": dataset["aph443"].astype("float32"),
+            "adg443": dataset["adg443"].astype("float32"),
+            "bbp443": dataset["bbp443"].astype("float32"),
+            "bbp_s": dataset["bbp_s"].astype("float32"),
+            "sst": dataset["sst"].astype("float32"),
         },
         coords={
             "lat": dataset["lat"].values,
@@ -298,6 +309,11 @@ def run_month(
             "preset": preset,
             "sensor": sensor,
             "year_day_used": int(yd),
+            "source_input_file": str(input_path),
+            "profile_inputs_embedded": 1,
+            "profile_input_variables": (
+                "par, chl, mld, aph443, adg443, bbp443, bbp_s, sst"
+            ),
             "sampling_note": (
                 "For stride > 1, only every nth valid candidate pixel was "
                 "calculated. Unsampled cells remain NaN."

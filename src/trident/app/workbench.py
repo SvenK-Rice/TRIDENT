@@ -25,6 +25,8 @@ from trident.workflows.catalog import FAMILIES, group_by_family
 from trident.workflows.merge import build_source_manifest
 from trident.grids.align import mask_feasible
 from trident.viz.maps import make_geo_heatmap as make_geo_heatmap_v2
+from trident.app.integrated_explorer import render_integrated_explorer
+from trident.app.native_scientist import render_acquisition, render_processing
 
 PRESETS = {
     "California Current": (-132, 28, -116, 45),
@@ -146,99 +148,161 @@ def _region_preview(bbox):
     return fig
 
 
-def _native_download_controls(root, start, end, bbox, temporal):
-    st.markdown("### 1. Download/cache native inputs")
-    c1, c2, c3 = st.columns(3)
-    use_nasa = c1.checkbox("NASA Earthdata ocean colour", value=True)
-    use_esa = c2.checkbox("ESA OC-CCI / Sentinel-3-derived ocean colour", value=True)
-    use_physics = c3.checkbox("Copernicus Marine SST + MLD", value=True)
-
-    nasa_sensor = st.selectbox("NASA sensor", ["MODIS Aqua", "VIIRS SNPP", "VIIRS NOAA-20", "PACE OCI"], index=0)
-    with st.expander("Advanced: NASA collection mappings"):
-        nasa_cols = {var: st.text_input(f"{var} collection short_name", value=default, key=f"nasa_{var}") for var, default in DEFAULT_NASA_COLLECTIONS.items()}
-        st.caption("Collection names remain editable because NASA short names change with mission and reprocessing.")
-
-    product_name = st.selectbox("ESA ocean-colour product", list(ESA_PRODUCTS), index=0)
-    esa_cfg = ESA_PRODUCTS[product_name]
-    esa_dataset_id = st.text_input("ESA/Copernicus dataset ID", value=esa_cfg["dataset_id"])
-    esa_variables_text = st.text_input("ESA variables", value=", ".join(esa_cfg["variables"]))
-
-    with st.expander("Advanced: Copernicus physical source"):
-        physical_dataset = st.text_input("Copernicus physical dataset ID", value=DEFAULT_CMEMS_DATASET)
-        physical_vars = st.text_input("Physical variables", value=", ".join(DEFAULT_CMEMS_VARIABLES))
-        cm_user = st.text_input("Copernicus username (optional)", value="")
-        cm_pass = st.text_input("Copernicus password (optional)", value="", type="password")
-        if st.button("Inspect ESA/Copernicus dataset metadata"):
-            st.json(inspect_copernicus_dataset(esa_dataset_id))
-
-    st.json({"NASA/Copernicus": production_status(root, start, end, bbox), "ESA": esa_status()})
-    st.dataframe(standard_cache_status(root, start, end), use_container_width=True)
-
-    if st.button("Download/cache selected native inputs", type="primary"):
-        req = NativeWorkflowRequest(
-            start_date=str(start), end_date=str(end), bbox=tuple(map(float, bbox)),
-            temporal="monthly" if temporal.startswith("Monthly") else "8day",
-            use_nasa=use_nasa, use_esa=use_esa, use_copernicus_physics=use_physics,
-            nasa_sensor=nasa_sensor, nasa_collections=nasa_cols,
-            esa_product_name=product_name, esa_dataset_id=esa_dataset_id,
-            esa_variables=[v.strip() for v in esa_variables_text.split(",") if v.strip()],
-            physical_dataset_id=physical_dataset,
-            physical_variables=[v.strip() for v in physical_vars.split(",") if v.strip()],
-            cmems_username=cm_user or None, cmems_password=cm_pass or None,
-        )
-        with st.status("Downloading native inputs...", expanded=True) as status:
-            report = run_native_download(root, req)
-            st.json(report)
-            st.json(build_source_manifest(root))
-            status.update(label="Native input download complete", state="complete")
+def _month_label(tag: str) -> str:
+    try:
+        return pd.Timestamp(f"{str(tag)[:4]}-{str(tag)[4:6]}-01").strftime("%B %Y")
+    except Exception:
+        return str(tag)
 
 
-def _native_processing_controls(root, start, end, bbox, stride):
-    st.markdown("### 2. Harmonize and run TRIDENT CAFE")
-    st.caption("TRIDENT searches the selected data folder for real NASA/ESA/Copernicus variables, verifies all eight CAFE inputs, aligns them to the chlorophyll grid, and only then enables NPP computation.")
-    c1, c2 = st.columns(2)
-    if c1.button("Prepare CAFE-ready native inputs"):
-        with st.status("Inspecting and harmonizing native inputs...", expanded=True) as status:
-            reports = prepare_native_inputs(root, start, end, bbox)
-            st.json(reports)
-            status.update(label="Native input preparation complete", state="complete")
-    if c2.button("Run TRIDENT Native CAFE"):
-        with st.status("Running native CAFE...", expanded=True) as status:
-            reports = run_native_cafe(root, start, end, int(stride))
-            st.json(reports)
-            status.update(label="Native CAFE complete", state="complete")
+def _service_state(value) -> tuple[str, str]:
+    if isinstance(value, dict):
+        available = value.get("available")
+        authenticated = value.get("authenticated")
+        if authenticated is True:
+            return "Connected", "success"
+        if available is True:
+            return "Available", "success"
+        message = value.get("message") or value.get("error")
+        return str(message or "Unavailable"), "error"
+    if value:
+        return "Available", "success"
+    return "Unavailable", "error"
 
-    prep_report = Path(root) / "reports/trident/native_prepare_report.json"
-    if prep_report.exists():
-        rows = json.loads(prep_report.read_text())
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
-        missing = sorted({m for r in rows for m in r.get("missing", [])})
-        if missing:
-            st.warning("Native CAFE is not ready for every month. Missing inputs: " + ", ".join(missing))
+
+def _status_badge(label: str, value: str, state: str = "neutral") -> None:
+    icons = {"success": "✓", "warning": "!", "error": "×", "neutral": "•"}
+    colors = {
+        "success": "#15803d",
+        "warning": "#a16207",
+        "error": "#b91c1c",
+        "neutral": "#475569",
+    }
+    color = colors.get(state, colors["neutral"])
+    icon = icons.get(state, icons["neutral"])
+    st.markdown(
+        f"<div style='padding:0.6rem 0.75rem;border:1px solid #e2e8f0;"
+        f"border-radius:0.55rem;margin-bottom:0.35rem'>"
+        f"<span style='color:{color};font-weight:700'>{icon}</span> "
+        f"<strong>{label}</strong><br>"
+        f"<span style='color:#64748b'>{value}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _render_acquisition_summary(reports: list[dict]) -> None:
+    if not reports:
+        return
+    st.markdown("#### Acquisition summary")
+    for report in reports:
+        month = _month_label(report.get("month") or report.get("tag") or "")
+        items = report.get("items") or report.get("results") or []
+        if isinstance(items, dict):
+            items = [dict(name=k, **(v if isinstance(v, dict) else {"status": v})) for k, v in items.items()]
+        ok = 0
+        total = 0
+        for item in items:
+            total += 1
+            if str(item.get("status", "")).lower() in {"ok", "reused", "available", "downloaded"}:
+                ok += 1
+        if total:
+            state = "success" if ok == total else "warning"
+            _status_badge(month, f"{ok} of {total} required source groups available", state)
         else:
-            st.success("All required CAFE inputs were found and harmonized for the prepared months.")
+            manifest = report.get("manifest") or report.get("manifest_file")
+            _status_badge(month, "Acquisition completed" + (f" · {manifest}" if manifest else ""), "success")
 
+
+def _render_prepare_summary(reports: list[dict]) -> None:
+    if not reports:
+        st.info("No preparation report is available yet.")
+        return
+    st.markdown("#### Prepared-input status")
+    for report in reports:
+        tag = str(report.get("tag", ""))
+        missing = list(report.get("missing") or [])
+        output = report.get("output_file")
+        valid = int(report.get("valid_pixels") or report.get("joint_valid_pixels") or 0)
+        shape = report.get("shape")
+        if output and not missing and valid > 0:
+            details = f"Ready · {valid:,} jointly valid pixels"
+            if shape:
+                details += f" · grid {shape[0]} × {shape[1]}"
+            _status_badge(_month_label(tag), details, "success")
+            st.caption(Path(output).name)
+        elif missing:
+            _status_badge(
+                _month_label(tag),
+                "Missing: " + ", ".join(missing),
+                "warning",
+            )
+        else:
+            _status_badge(_month_label(tag), "Preparation required", "warning")
+
+
+def _render_cafe_summary(reports: list[dict]) -> None:
+    if not reports:
+        return
+    st.markdown("#### Native CAFE results")
+    for report in reports:
+        tag = str(report.get("tag", ""))
+        status = str(report.get("status", "")).lower()
+        output = report.get("output_file")
+        success = report.get("success")
+        if output or status in {"calculated", "complete", "ok", "reused"}:
+            detail = "Regional CAFE product ready"
+            if success is not None:
+                detail += f" · {int(success):,} calculated pixels"
+            _status_badge(_month_label(tag), detail, "success")
+            if output:
+                st.caption(Path(output).name)
+        else:
+            _status_badge(_month_label(tag), status.replace("_", " ") or "Not run", "warning")
+
+
+def _phase3_acquire(root, start, end, bbox, force: bool = False) -> list[dict]:
+    """Use the unified Phase 3 acquisition engine when installed."""
+    try:
+        from trident.data_sources.acquisition import acquire_month
+    except ImportError as exc:
+        raise RuntimeError(
+            "The unified Phase 3 acquisition engine is not installed. "
+            "Install the Phase 3 pipeline update before acquiring data."
+        ) from exc
+
+    reports: list[dict] = []
+    for month in month_starts(start, end):
+        tag = pd.Timestamp(month).strftime("%Y%m")
+        result = acquire_month(
+            root,
+            tag,
+            tuple(map(float, bbox)),
+            nasa_login_strategy="netrc",
+            force=bool(force),
+        )
+        if isinstance(result, dict):
+            reports.append(result)
+        else:
+            reports.append({"month": tag, "status": "complete", "result": str(result)})
+    return reports
+
+
+
+def _native_download_controls(root, start, end, bbox, temporal):
+    """Render the scientist-facing Native acquisition workflow."""
+    render_acquisition(root, start, end, bbox, temporal)
+
+def _native_processing_controls(root, start, end, bbox, stride, region_name, cadence):
+    """Render prepared-input status and regional CAFE controls."""
+    render_processing(
+        root, start, end, bbox, stride,
+        region_name=region_name,
+        cadence=cadence,
+    )
 
 def _explore(root):
-    grouped = group_by_family(root)
-    available = {k: v for k, v in grouped.items() if v}
-    if not available:
-        st.info("No processed products are available yet.")
-        return
-    family = st.selectbox("Product", list(available), format_func=lambda k: FAMILIES[k][1])
-    entries = available[family]
-    by_tag = {e.tag: e for e in entries}
-    tag = st.selectbox("Time", sorted(by_tag), index=len(by_tag) - 1)
-    entry = by_tag[tag]
-    ds = xr.open_dataset(entry.path)
-    variables = list(ds.data_vars)
-    preferred = next((v for v in ("difference", "cafe_npp", "trident_replay_npp", "osu_archived_npp", "chl") if v in variables), variables[0])
-    var = st.selectbox("Variable", variables, index=variables.index(preferred))
-    st.plotly_chart(make_geo_heatmap_v2(ds, var, f"{entry.label} — {tag}"), use_container_width=True)
-    with st.expander("Dataset details"):
-        st.write(entry.path)
-        st.write(ds)
-    ds.close()
+    """Explore existing regional products and drill into pixel physiology."""
+    render_integrated_explorer(root)
 
 
 def app():
@@ -443,7 +507,12 @@ def app():
     with native:
         _native_download_controls(root, start, end, bbox, temporal)
         st.divider()
-        _native_processing_controls(root, start, end, bbox, stride)
+        # The current Native preparation pipeline is monthly; the cadence is
+        # explicit in storage so future 8-day shards remain isolated.
+        native_cadence = "monthly"
+        _native_processing_controls(
+            root, start, end, bbox, stride, region, native_cadence
+        )
 
     with explore:
         _explore(root)

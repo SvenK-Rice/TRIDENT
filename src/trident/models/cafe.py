@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
 
 import numpy as np
 
@@ -66,6 +65,72 @@ class CafeDiagnostics:
     eu: float
     valid: bool
     reason: str = "ok"
+
+
+@dataclass
+class CafeProfileResult:
+    """Complete profile-preserving output from the validated CAFE engine.
+
+    Arrays retain the native CAFE discretization: 51 normalized daylight
+    time points, 101 depths, and 31 wavelengths from 400 to 700 nm.
+    """
+
+    npp: float
+    zeu: float
+    kdpar: float
+    eu: float
+    valid: bool
+    reason: str
+    depth_m: np.ndarray
+    time_fraction: np.ndarray
+    wavelength_nm: np.ndarray
+    delz_m: float
+    absorption_total: np.ndarray
+    absorption_phytoplankton: np.ndarray
+    backscattering: np.ndarray
+    kd_spectral: np.ndarray
+    irradiance_tzw: np.ndarray
+    absorbed_photons_tzw: np.ndarray
+    irradiance_tz: np.ndarray
+    absorbed_photons_tz: np.ndarray
+    absorbed_photons_tz_scaled: np.ndarray
+    absorbed_photons_z: np.ndarray
+    ek_z: np.ndarray
+    kpur_z: np.ndarray
+    phimax_z: np.ndarray
+    npp_tz: np.ndarray
+    npp_z: np.ndarray
+
+    @property
+    def par_z_noon(self) -> np.ndarray:
+        """Scalar irradiance profile at local noon (time index 25)."""
+        return self.irradiance_tz[25, :]
+
+
+def integrate_npp_profile(
+    depth_m: np.ndarray,
+    npp_z: np.ndarray,
+    *,
+    delz_m: float | None = None,
+) -> float:
+    """Integrate a CAFE daily NPP profile using legacy loop ordering.
+
+    Passing ``delz_m`` preserves bit-for-bit parity with the validated engine.
+    Without it, layer thicknesses are derived from the depth coordinate.
+    """
+    depth = np.asarray(depth_m, dtype=float)
+    profile = np.asarray(npp_z, dtype=float)
+    if depth.ndim != 1 or profile.ndim != 1 or depth.shape != profile.shape:
+        raise ValueError("depth_m and npp_z must be one-dimensional arrays of equal length")
+    if depth.size < 2:
+        raise ValueError("at least two depth levels are required")
+    if delz_m is not None and (not np.isfinite(delz_m) or delz_m <= 0):
+        raise ValueError("delz_m must be a positive finite value")
+    total = 0.0
+    for z in range(depth.size - 1):
+        dz = float(delz_m) if delz_m is not None else depth[z + 1] - depth[z]
+        total += dz * (profile[z] + profile[z + 1]) / 2.0
+    return float(total)
 
 
 def betasw_zhh2009(lambda_nm: float, S: float, Tc: float) -> float:
@@ -145,7 +210,8 @@ def opp_cafe_pixel(
     bbp_s: float,
     sst: float,
     return_diagnostics: bool = False,
-) -> float | CafeDiagnostics:
+    return_profiles: bool = False,
+) -> float | CafeDiagnostics | CafeProfileResult:
     """Compute CAFE daily NPP for one pixel.
 
     The implementation preserves the Oregon code's core equations and integration
@@ -327,6 +393,34 @@ def opp_cafe_pixel(
     if not np.isfinite(NPP) or NPP < 0:
         NPP = np.nan
     diag = CafeDiagnostics(float(NPP), float(zeu), float(kdpar), float(Eu), np.isfinite(NPP), "ok")
+    if return_profiles:
+        return CafeProfileResult(
+            npp=float(NPP),
+            zeu=float(zeu),
+            kdpar=float(kdpar),
+            eu=float(Eu),
+            valid=bool(np.isfinite(NPP)),
+            reason="ok",
+            depth_m=zseq.copy(),
+            time_fraction=tseq.copy(),
+            wavelength_nm=WV.copy(),
+            delz_m=float(delz),
+            absorption_total=a.copy(),
+            absorption_phytoplankton=aphi.copy(),
+            backscattering=bb.copy(),
+            kd_spectral=kd.copy(),
+            irradiance_tzw=E_tzw.copy(),
+            absorbed_photons_tzw=AP_tzw.copy(),
+            irradiance_tz=E_tz.copy(),
+            absorbed_photons_tz=AP_tz.copy(),
+            absorbed_photons_tz_scaled=AP_tz2.copy(),
+            absorbed_photons_z=AP_z.copy(),
+            ek_z=Ek.copy(),
+            kpur_z=KPUR.copy(),
+            phimax_z=phimax.copy(),
+            npp_tz=NPP_tz.copy(),
+            npp_z=NPP_z.copy(),
+        )
     return diag if return_diagnostics else diag.npp
 
 @dataclass
@@ -345,3 +439,18 @@ def cafe_pixel(par, chl, mld, lat, yd, aph443, adg443, bbp443, bbp_s, sst):
     """
     res = opp_cafe_pixel(par, chl, mld, lat, yd, aph443, adg443, bbp443, bbp_s, sst, return_diagnostics=True)
     return CafeResult(float(res.npp), float(res.zeu), float(res.kdpar))
+
+
+def cafe_profile(par, chl, mld, lat, yd, aph443, adg443, bbp443, bbp_s, sst) -> CafeProfileResult:
+    """Return the complete time-, depth-, and wavelength-resolved CAFE result.
+
+    This function uses the same numerical pathway as :func:`cafe_pixel`; it
+    only preserves arrays that the legacy interface discards after integration.
+    """
+    result = opp_cafe_pixel(
+        par, chl, mld, lat, yd, aph443, adg443, bbp443, bbp_s, sst,
+        return_profiles=True,
+    )
+    if not isinstance(result, CafeProfileResult):
+        raise ValueError(f"CAFE profile could not be computed: {result.reason}")
+    return result

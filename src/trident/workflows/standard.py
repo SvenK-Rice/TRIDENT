@@ -1,125 +1,207 @@
 from __future__ import annotations
+
 from dataclasses import asdict, dataclass
-from pathlib import Path
 import json
+from pathlib import Path
+from typing import Any
+
 import pandas as pd
-from trident.data.nasa.earthdata import EarthdataRequest, is_available as earthdata_available, search_granules, download_granules
-from trident.data.copernicus.cmems import CopernicusRequest, is_available as copernicus_available, subset as copernicus_subset
+
+from trident.data.nasa.earthdata import (
+    EarthdataRequest,
+    auth_status as earthdata_auth_status,
+    ensure_request as ensure_earthdata_request,
+    is_available as earthdata_available,
+    search_collections,
+)
+from trident.data.copernicus.cmems import (
+    CopernicusRequest,
+    credentials_status as copernicus_credentials_status,
+    ensure_subset as ensure_copernicus_subset,
+    is_available as copernicus_available,
+)
+
 
 @dataclass
 class ProductionRequest:
     start_date: str
     end_date: str
-    bbox: tuple[float,float,float,float]
-    temporal: str = 'monthly'
-    sensor: str = 'MODIS Aqua'
-    nasa_collections: dict | None = None
+    bbox: tuple[float, float, float, float]
+    temporal: str = "monthly"
+    sensor: str = "MODIS Aqua"
+    nasa_collections: dict[str, str] | None = None
     copernicus_dataset_id: str | None = None
     copernicus_variables: list[str] | None = None
-    earthdata_strategy: str = 'netrc'
+    earthdata_strategy: str | None = None
     cmems_username: str | None = None
     cmems_password: str | None = None
+    force: bool = False
 
+
+# These remain editable because the exact short_name must be confirmed through
+# CMR discovery for the desired mission, processing level, and reprocessing.
 DEFAULT_NASA_COLLECTIONS = {
-    # These are user-editable in the app because NASA collection short names vary
-    # with sensor/reprocessing. Empty values are skipped.
-    'chl': '',
-    'par': '',
-    'aph443': '',
-    'adg443': '',
-    'bbp443': '',
-    'bbp_s': '',
+    "chl": "",
+    "par": "",
+    "aph443": "",
+    "adg443": "",
+    "bbp443": "",
+    "bbp_s": "",
 }
 
-DEFAULT_CMEMS_DATASET = 'cmems_mod_glo_phy_anfc_0.083deg_P1D-m'
-DEFAULT_CMEMS_VARIABLES = ['thetao','mlotst']
+# Keep these user-editable. Copernicus dataset IDs and variables evolve.
+DEFAULT_CMEMS_DATASET = "cmems_mod_glo_phy_anfc_0.083deg_P1M-m"
+DEFAULT_CMEMS_VARIABLES = ["thetao", "mlotst"]
+
 
 def production_status(root, start, end, bbox):
-    root = Path(root)
-    ea_ok, ea_msg = earthdata_available()
-    cm_ok, cm_msg = copernicus_available()
+    earth_ok, earth_message = earthdata_available()
+    cm_ok, cm_message = copernicus_available()
     return {
-        'mode': 'TRIDENT Standard: NASA Earthdata + Copernicus',
-        'earthdata_available': ea_ok,
-        'earthdata_message': ea_msg,
-        'copernicus_available': cm_ok,
-        'copernicus_message': cm_msg,
-        'requested_start': str(start),
-        'requested_end': str(end),
-        'bbox': list(map(float, bbox)),
-        'cache_dirs': {
-            'earthdata': str(root / 'data/reference/nasa'),
-            'copernicus': str(root / 'data/reference/copernicus'),
-            'processed': str(root / 'data/processed'),
+        "mode": "TRIDENT Native acquisition",
+        "earthdata_available": earth_ok,
+        "earthdata_message": earth_message,
+        "earthdata_auth": earthdata_auth_status(),
+        "copernicus_available": cm_ok,
+        "copernicus_message": cm_message,
+        "copernicus_credentials": copernicus_credentials_status(),
+        "requested_start": str(start),
+        "requested_end": str(end),
+        "bbox": list(map(float, bbox)),
+        "cache_dirs": {
+            "earthdata": str(Path(root) / "data/reference/nasa"),
+            "copernicus": str(Path(root) / "data/reference/copernicus"),
         },
-        'planned_inputs': ['chl', 'par', 'aph443', 'adg443', 'bbp443', 'bbp_s', 'sst', 'mld'],
-        'note': 'Download layer is active. CAFE execution from NASA/Copernicus products will be enabled after collection mappings and variable harmonization are validated.'
+        "required_cafe_inputs": [
+            "chl",
+            "par",
+            "aph443",
+            "adg443",
+            "bbp443",
+            "bbp_s",
+            "sst",
+            "mld",
+        ],
     }
 
-def _month_tag(d):
-    return f'{d.year}{d.month:02d}'
+
+def discover_nasa_collections(keyword: str, count: int = 25):
+    """UI-friendly wrapper for Earthdata CMR collection discovery."""
+    return search_collections(keyword, count=count)
+
 
 def standard_cache_status(root, start, end):
-    root=Path(root)
-    dates=pd.date_range(str(start), str(end), freq='MS')
-    rows=[]
-    for d in dates:
-        tag=f'{d.year}{d.month:02d}'
-        nasa=list((root/'data/reference/nasa').glob(f'**/*{tag}*'))
-        cm=list((root/'data/reference/copernicus').glob(f'**/*{tag}*'))
-        rows.append({'month':tag,'nasa_cached_files':len(nasa),'copernicus_cached_files':len(cm)})
+    root = Path(root)
+    dates = pd.date_range(str(start), str(end), freq="MS")
+    rows = []
+
+    for month in dates:
+        tag = month.strftime("%Y%m")
+        nasa = list((root / "data/reference/nasa").glob("**/*"))
+        copernicus = list((root / "data/reference/copernicus").glob("**/*"))
+        rows.append(
+            {
+                "month": tag,
+                "nasa_cached_files": sum(
+                    path.is_file() for path in nasa
+                ),
+                "copernicus_cached_files": sum(
+                    path.is_file() for path in copernicus
+                ),
+            }
+        )
     return pd.DataFrame(rows)
 
-def download_standard_inputs(root, req: ProductionRequest):
-    """Download/cache requested NASA Earthdata and Copernicus inputs.
 
-    This is intentionally a data acquisition workflow only. It does not yet
-    harmonize all variables into CAFE-ready inputs because the correct NASA
-    collection short names and variable names must be selected and validated.
+def download_standard_inputs(root, request: ProductionRequest):
+    """Acquire and cache NASA ocean color plus Copernicus physics.
+
+    This stage intentionally downloads and catalogs the actual source files.
+    It does not yet claim that the variables are CAFE-ready; scaling, units,
+    temporal aggregation, and grid harmonization are validated downstream.
     """
-    root=Path(root)
-    report={'request':asdict(req),'earthdata':{},'copernicus':{},'outputs':[]}
-    root.joinpath('reports/trident').mkdir(parents=True, exist_ok=True)
+    root = Path(root).expanduser().resolve()
+    report: dict[str, Any] = {
+        "request": {
+            **asdict(request),
+            "cmems_password": None,
+        },
+        "earthdata": {},
+        "copernicus": {},
+        "outputs": [],
+    }
 
-    collections=dict(DEFAULT_NASA_COLLECTIONS)
-    if req.nasa_collections:
-        collections.update(req.nasa_collections)
+    collections = dict(DEFAULT_NASA_COLLECTIONS)
+    if request.nasa_collections:
+        collections.update(request.nasa_collections)
 
-    ea_ok, ea_msg=earthdata_available()
-    report['earthdata']['available']=ea_ok
-    report['earthdata']['message']=ea_msg
-    if ea_ok:
-        for var, short_name in collections.items():
-            if not short_name:
-                report['earthdata'][var]={'status':'skipped','reason':'no collection short_name specified'}
-                continue
-            out_dir=root/'data/reference/nasa'/req.sensor.replace(' ','_')/var
-            try:
-                ereq=EarthdataRequest(sensor=req.sensor, product=short_name, start_date=str(req.start_date), end_date=str(req.end_date), bbox=req.bbox, temporal=req.temporal)
-                granules=search_granules(ereq, count=500)
-                paths=download_granules(granules, out_dir)
-                report['earthdata'][var]={'status':'downloaded','collection':short_name,'n_granules':len(granules),'paths':[str(p) for p in paths]}
-                report['outputs'].extend([str(p) for p in paths])
-            except Exception as e:
-                report['earthdata'][var]={'status':'error','collection':short_name,'error':str(e)}
+    for variable, short_name in collections.items():
+        if not short_name:
+            report["earthdata"][variable] = {
+                "status": "skipped",
+                "reason": "No NASA collection short_name selected",
+            }
+            continue
 
-    cm_ok, cm_msg=copernicus_available()
-    report['copernicus']['available']=cm_ok
-    report['copernicus']['message']=cm_msg
-    dsid=req.copernicus_dataset_id
-    vars=req.copernicus_variables or []
-    if cm_ok and dsid and vars:
+        earth_request = EarthdataRequest(
+            short_name=short_name,
+            start_date=str(request.start_date),
+            end_date=str(request.end_date),
+            bbox=request.bbox,
+            variable=variable,
+            sensor=request.sensor,
+            temporal=request.temporal,
+        )
+
         try:
-            out_file=root/'data/reference/copernicus'/f'copernicus_{str(req.start_date)[:10]}_{str(req.end_date)[:10]}.nc'
-            creq=CopernicusRequest(dataset_id=dsid, variables=list(vars), start_datetime=str(req.start_date), end_datetime=str(req.end_date), bbox=req.bbox)
-            result=copernicus_subset(creq, out_file, username=req.cmems_username, password=req.cmems_password)
-            report['copernicus']['subset']={'status':'downloaded','dataset_id':dsid,'variables':vars,'path':str(out_file),'result':str(result)}
-            report['outputs'].append(str(out_file))
-        except Exception as e:
-            report['copernicus']['subset']={'status':'error','dataset_id':dsid,'variables':vars,'error':str(e)}
-    else:
-        report['copernicus']['subset']={'status':'skipped','reason':'copernicus client unavailable or dataset/variables not specified'}
+            result = ensure_earthdata_request(
+                root,
+                earth_request,
+                login_strategy=request.earthdata_strategy,
+                force=request.force,
+            )
+            report["earthdata"][variable] = result
+            report["outputs"].extend(result.get("files", []))
+        except Exception as exc:
+            report["earthdata"][variable] = {
+                "status": "error",
+                "collection": short_name,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
-    out=root/'reports/trident/standard_download_report.json'
-    out.write_text(json.dumps(report, indent=2))
+    if request.copernicus_dataset_id and request.copernicus_variables:
+        cm_request = CopernicusRequest(
+            dataset_id=request.copernicus_dataset_id,
+            variables=tuple(request.copernicus_variables),
+            start_datetime=str(request.start_date),
+            end_datetime=str(request.end_date),
+            bbox=request.bbox,
+        )
+        try:
+            result = ensure_copernicus_subset(
+                root,
+                cm_request,
+                username=request.cmems_username,
+                password=request.cmems_password,
+                force=request.force,
+            )
+            report["copernicus"]["subset"] = result
+            report["outputs"].append(result["output_file"])
+        except Exception as exc:
+            report["copernicus"]["subset"] = {
+                "status": "error",
+                "dataset_id": request.copernicus_dataset_id,
+                "variables": request.copernicus_variables,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+    else:
+        report["copernicus"]["subset"] = {
+            "status": "skipped",
+            "reason": "No Copernicus dataset ID or variables selected",
+        }
+
+    output = root / "reports" / "trident" / "standard_download_report.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    report["report_file"] = str(output)
     return report
